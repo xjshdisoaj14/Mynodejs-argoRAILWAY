@@ -23,7 +23,7 @@ const fs = require('fs');
 const crypto = require('crypto');
 const { spawn } = require('child_process');
 
-const PORT = Number(process.env.PORT || process.env.SERVER_PORT || 3000);
+const PORT = Number(process.env.PORT || process.env.SERVER_PORT || 8000);
 const UUID = process.env.UUID || crypto.randomUUID();
 const SUB_PATH = (process.env.SUB_PATH || 'sub').replace(/^\/+|\/+$/g, '');
 const NAME = process.env.NAME || 'argo';
