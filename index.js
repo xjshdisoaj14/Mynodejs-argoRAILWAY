@@ -20,6 +20,8 @@
 const http = require('http');
 const path = require('path');
 const fs = require('fs');
+const net = require('net');
+const https = require('https');
 const crypto = require('crypto');
 const { spawn } = require('child_process');
 
@@ -44,9 +46,23 @@ try {
 
 let domain = '';
 let subText = '';
-let cfdRestarts = 0;
 let cfdProc = null;
 let xrayProc = null;
+
+/* ---- 自愈参数 ---- */
+// 进程存活超过这个时长后重置重启计数，避免「累计三次就永久放弃」
+const RESTART_RESET_MS = 10 * 60 * 1000;
+const MAX_RESTARTS = 5;
+// 保活：周期访问隧道域名，确认端到端可用，同时避免 quick tunnel 因闲置被回收
+const KEEPALIVE = String(process.env.KEEPALIVE || 'true').toLowerCase() !== 'false';
+const PING_INTERVAL_MS = Number(process.env.PING_INTERVAL || 300) * 1000;
+const WATCHDOG_INTERVAL_MS = 60 * 1000;
+
+let cfdRestarts = 0;
+let xrayRestarts = 0;
+let cfdStartedAt = 0;
+let xrayStartedAt = 0;
+let pingFails = 0;
 
 function log(...args) {
   console.log(`[${new Date().toISOString()}]`, ...args);
@@ -104,13 +120,18 @@ function startXray() {
     return;
   }
 
+  xrayStartedAt = Date.now();
   xrayProc.on('error', (e) => log('xray 启动失败:', e.message));
   xrayProc.on('exit', (code, sig) => {
     log(`xray 退出 code=${code} sig=${sig}`);
-    // 有限次重启，避免死循环刷日志
-    if (cfdRestarts < 3) {
-      setTimeout(startXray, 3000);
+    // 稳定运行过一段时间就清零，避免计数终身累积
+    if (Date.now() - xrayStartedAt > RESTART_RESET_MS) xrayRestarts = 0;
+    xrayRestarts += 1;
+    if (xrayRestarts > MAX_RESTARTS) {
+      log(`xray 连续失败超过 ${MAX_RESTARTS} 次，交给看门狗兜底`);
+      return;
     }
+    setTimeout(startXray, Math.min(3000 * xrayRestarts, 30000));
   });
   log(`xray 已启动，监听 127.0.0.1:${XRAY_PORT}`);
 }
@@ -179,15 +200,18 @@ function startCloudflared() {
 
   cfdProc.on('error', (e) => log('cloudflared 启动失败:', e.message));
 
+  cfdStartedAt = Date.now();
   cfdProc.on('exit', (code, sig) => {
     log(`cloudflared 退出 code=${code} sig=${sig}`);
-    if (cfdRestarts >= 3) {
-      log('cloudflared 连续失败 3 次，停止重试。请检查出口网络或改用固定隧道。');
+    if (Date.now() - cfdStartedAt > RESTART_RESET_MS) cfdRestarts = 0;
+    cfdRestarts += 1;
+    if (cfdRestarts > MAX_RESTARTS) {
+      log(`cloudflared 连续失败超过 ${MAX_RESTARTS} 次，交给看门狗兜底`);
       return;
     }
-    cfdRestarts += 1;
     domain = '';
-    setTimeout(startCloudflared, 5000 * cfdRestarts);
+    subText = '';
+    setTimeout(startCloudflared, Math.min(5000 * cfdRestarts, 60000));
   });
 
   log('cloudflared 已启动，等待隧道地址…');
@@ -238,7 +262,22 @@ const server = http.createServer((req, res) => {
   if (p === '/status') {
     res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
     return res.end(
-      JSON.stringify({ ready: Boolean(domain), domain, subPath: SUB_PATH, uuid: UUID }, null, 2)
+      JSON.stringify(
+        {
+          ready: Boolean(domain),
+          domain,
+          subPath: SUB_PATH,
+          uuid: UUID,
+          keepalive: KEEPALIVE,
+          pingIntervalSec: PING_INTERVAL_MS / 1000,
+          pingFails,
+          xrayRestarts,
+          cfdRestarts,
+          uptimeSec: Math.round(process.uptime()),
+        },
+        null,
+        2
+      )
     );
   }
 
@@ -255,6 +294,85 @@ server.listen(PORT, '0.0.0.0', () => {
   log(`HTTP 服务已监听 0.0.0.0:${PORT}`);
   log(`订阅地址: /${SUB_PATH}`);
 });
+
+/* ---------------- 看门狗 & 保活 ---------------- */
+
+// 探测本地端口是否真的在监听（能发现「进程还在但服务已死」）
+function checkPort(port, host = '127.0.0.1', timeout = 3000) {
+  return new Promise((resolve) => {
+    const sock = net.connect({ port, host });
+    let settled = false;
+    const finish = (ok) => {
+      if (settled) return;
+      settled = true;
+      try { sock.destroy(); } catch (_) {}
+      resolve(ok);
+    };
+    sock.setTimeout(timeout);
+    sock.on('connect', () => finish(true));
+    sock.on('timeout', () => finish(false));
+    sock.on('error', () => finish(false));
+  });
+}
+
+async function watchdog() {
+  // 1) Xray 端口
+  if (!(await checkPort(XRAY_PORT))) {
+    log('看门狗: xray 端口不通，强制重启');
+    try { xrayProc && xrayProc.kill('SIGKILL'); } catch (_) {}
+    xrayRestarts = 0;
+    setTimeout(startXray, 1000);
+  }
+
+  // 2) cloudflared 进程
+  const cfdAlive = cfdProc && cfdProc.exitCode === null && !cfdProc.killed;
+  if (!cfdAlive) {
+    log('看门狗: cloudflared 不在运行，重启');
+    cfdRestarts = 0;
+    setTimeout(startCloudflared, 1000);
+  } else if (!domain) {
+    log('看门狗: cloudflared 在跑但还没拿到隧道域名，继续等待');
+  }
+}
+
+// 周期访问隧道域名：既确认端到端可用，也让 quick tunnel 保持活跃
+function pingTunnel() {
+  if (!domain) return;
+  const req = https.get(
+    `https://${domain}/`,
+    { timeout: 15000, headers: { 'User-Agent': 'vless-argo-keepalive' } },
+    (res) => {
+      res.resume();
+      if (pingFails) log(`保活: 隧道恢复（此前连续失败 ${pingFails} 次）`);
+      pingFails = 0;
+    }
+  );
+  req.on('timeout', () => req.destroy(new Error('timeout')));
+  req.on('error', (e) => {
+    pingFails += 1;
+    log(`保活: 隧道探测失败 ${pingFails} 次 - ${e.message}`);
+    if (pingFails >= 3) {
+      log('保活: 连续失败 3 次，重启 cloudflared 换新隧道');
+      pingFails = 0;
+      try { cfdProc && cfdProc.kill('SIGKILL'); } catch (_) {}
+      domain = '';
+      subText = '';
+      cfdRestarts = 0;
+      setTimeout(startCloudflared, 2000);
+    }
+  });
+}
+
+setInterval(watchdog, WATCHDOG_INTERVAL_MS);
+log(`看门狗已开启，每 ${WATCHDOG_INTERVAL_MS / 1000} 秒检查一次`);
+
+if (KEEPALIVE) {
+  setTimeout(pingTunnel, 60 * 1000);
+  setInterval(pingTunnel, PING_INTERVAL_MS);
+  log(`保活已开启，每 ${PING_INTERVAL_MS / 1000} 秒探测一次隧道`);
+} else {
+  log('保活已关闭（KEEPALIVE=false）');
+}
 
 /* ---------------- 启动 ---------------- */
 
