@@ -31,9 +31,16 @@ const CFIP = (process.env.CFIP || '').trim();
 const CFPORT = Number(process.env.CFPORT || 443);
 const XRAY_PORT = Number(process.env.XRAY_PORT || process.env.ARGO_PORT || 8001);
 
-const WORKDIR = __dirname;
+// 运行时文件必须写到可写目录：Hostless 的容器根文件系统是只读的（EROFS）
+const WORKDIR = process.env.RUNTIME_DIR || '/tmp';
 const XRAY_BIN = process.env.XRAY_BIN || '/usr/local/bin/xray';
 const CFD_BIN = process.env.CFD_BIN || '/usr/local/bin/cloudflared';
+
+try {
+  fs.mkdirSync(WORKDIR, { recursive: true });
+} catch (e) {
+  console.error('无法创建运行目录', WORKDIR, e.message);
+}
 
 let domain = '';
 let subText = '';
@@ -44,6 +51,10 @@ let xrayProc = null;
 function log(...args) {
   console.log(`[${new Date().toISOString()}]`, ...args);
 }
+
+// 兜底：任何未捕获异常都不允许把 HTTP 服务带走（否则平台会判定启动失败）
+process.on('uncaughtException', (e) => log('未捕获异常（已忽略，服务继续）:', e && e.message));
+process.on('unhandledRejection', (e) => log('未处理拒绝（已忽略）:', e && e.message));
 
 /* ---------------- Xray ---------------- */
 
@@ -78,8 +89,20 @@ function writeXrayConfig() {
 }
 
 function startXray() {
-  const cfgFile = writeXrayConfig();
-  xrayProc = spawn(XRAY_BIN, ['run', '-c', cfgFile], { stdio: ['ignore', 'inherit', 'inherit'] });
+  let cfgFile;
+  try {
+    cfgFile = writeXrayConfig();
+  } catch (e) {
+    log('写 xray 配置失败:', e.message);
+    return;
+  }
+
+  try {
+    xrayProc = spawn(XRAY_BIN, ['run', '-c', cfgFile], { stdio: ['ignore', 'inherit', 'inherit'] });
+  } catch (e) {
+    log('xray 启动失败:', e.message);
+    return;
+  }
 
   xrayProc.on('error', (e) => log('xray 启动失败:', e.message));
   xrayProc.on('exit', (code, sig) => {
@@ -128,11 +151,16 @@ function refreshSub() {
 }
 
 function startCloudflared() {
-  cfdProc = spawn(
-    CFD_BIN,
-    ['tunnel', '--no-autoupdate', '--edge-ip-version', 'auto', '--url', `http://127.0.0.1:${XRAY_PORT}`],
-    { stdio: ['ignore', 'pipe', 'pipe'] }
-  );
+  try {
+    cfdProc = spawn(
+      CFD_BIN,
+      ['tunnel', '--no-autoupdate', '--edge-ip-version', 'auto', '--url', `http://127.0.0.1:${XRAY_PORT}`],
+      { stdio: ['ignore', 'pipe', 'pipe'] }
+    );
+  } catch (e) {
+    log('cloudflared 启动失败:', e.message);
+    return;
+  }
 
   const onChunk = (buf) => {
     const text = buf.toString();
